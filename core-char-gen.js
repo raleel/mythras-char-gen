@@ -25,7 +25,7 @@ function roll(dice) {
 }
 
 /* =========================
-   Data
+   Data helpers
    ========================= */
 
 function skillRoot(name) {
@@ -36,6 +36,7 @@ function skillRoot(name) {
 function skillBase(name, chars) {
   const root = skillRoot(name);
   if (root === "Combat Style") {
+    // Combat Styles use STR+DEX as their base
     return chars.STR + chars.DEX;
   }
   const formula = SKILL_BASE_FORMULAS[root];
@@ -47,6 +48,22 @@ function skillBase(name, chars) {
 /* =========================
    Helpers
    ========================= */
+
+function expandSkillChoices(skillList) {
+  const finalList = [];
+
+  for (const entry of skillList) {
+    if (Array.isArray(entry)) {
+      // entry is a [ "Boating", "Ride" ] style choice
+      const pick = entry[Math.floor(Math.random() * entry.length)];
+      finalList.push(pick);
+    } else {
+      finalList.push(entry);
+    }
+  }
+
+  return finalList;
+}
 
 function specialiseSkillName(template, cultureName, cache) {
   if (!template.includes("(any)")) return template;
@@ -72,7 +89,7 @@ function ensureSkill(skills, name, chars) {
   if (!skills[name]) {
     let base = skillBase(name, chars);
 
-    // +40% free bonus for native Customs and Native Tongue
+    // +40% free bonus for native Customs and Native Tongue (core rule)
     if (name === "Customs" || name === "Native Tongue") {
       base += 40;
     }
@@ -87,24 +104,133 @@ function ensureSkill(skills, name, chars) {
   }
 }
 
-function randomPointDistributionCappedStage(skillNames, totalPoints, maxPerSkill, existingStagePoints) {
+function ensurePairedSpecialsInSelection(picked, allAvailable, maxCount) {
+  const result = [...picked];
+
+  function findByRoot(list, root) {
+    return list.find((name) => skillRoot(name) === root);
+  }
+
+  for (let i = 0; i < result.length; i++) {
+    const name = result[i];
+    const root = skillRoot(name);
+    const pairRoot = SPECIAL_SKILL_PAIRS[root];
+    if (!pairRoot) continue;
+
+    const hasPairAlready = result.some((s) => skillRoot(s) === pairRoot);
+    if (hasPairAlready) continue;
+
+    const partnerName = findByRoot(allAvailable, pairRoot);
+    if (!partnerName) continue; // that career/culture doesn't offer the pair
+
+    // If we still have room (< maxCount), just add the partner.
+    if (result.length < maxCount) {
+      if (!result.includes(partnerName)) {
+        result.push(partnerName);
+      }
+    } else {
+      // No room: replace one of the *other* skills with the partner.
+      const replaceable = result
+        .map((s, idx) => ({ s, idx }))
+        .filter((x) => x.idx !== i); // don't replace the original one
+
+      if (!replaceable.length) continue;
+      const choice =
+        replaceable[Math.floor(Math.random() * replaceable.length)];
+      result[choice.idx] = partnerName;
+    }
+  }
+
+  // Just in case we somehow exceeded maxCount, trim back randomly.
+  while (result.length > maxCount) {
+    result.splice(Math.floor(Math.random() * result.length), 1);
+  }
+
+  return result;
+}
+
+function enforceSpecialPairsInStagePoints(stagePoints) {
+  const names = Object.keys(stagePoints);
+
+  for (const name of names) {
+    const pts = stagePoints[name];
+    if (!pts || pts <= 0) continue;
+
+    const root = skillRoot(name);
+    const pairRoot = SPECIAL_SKILL_PAIRS[root];
+    if (!pairRoot) continue;
+
+    // See if the partner is already in this stage
+    let partnerName = Object.keys(stagePoints).find(
+      (n) => skillRoot(n) === pairRoot
+    );
+
+    if (!partnerName) {
+      // No partner yet: create an unspecialised partner
+      partnerName = pairRoot;
+    }
+
+    if (!stagePoints[partnerName]) {
+      // Split some of this skill's points into the partner.
+      const extra = Math.max(1, Math.floor(pts / 2));
+
+      // Try not to reduce the original below 1
+      if (stagePoints[name] > extra) {
+        stagePoints[name] -= extra;
+      }
+      // Give the partner some points
+      stagePoints[partnerName] = (stagePoints[partnerName] || 0) + extra;
+    }
+  }
+}
+
+/**
+ * Distribute points across skills with an optional per-skill cap and
+ * optional bias towards a set of priority skills.
+ *
+ * @param {string[]} skillNames            Skills eligible for points
+ * @param {number} totalPoints             Pool of points to distribute
+ * @param {number|null} maxPerSkill        Max points per skill for this stage
+ * @param {Object<string,number>} existingStagePoints  Already assigned at this stage
+ * @param {string[]} prioritySkills        Skills that should be favoured
+ */
+function randomPointDistributionCappedStage(
+  skillNames,
+  totalPoints,
+  maxPerSkill,
+  existingStagePoints,
+  prioritySkills = []
+) {
   if (!skillNames.length || totalPoints <= 0) return {};
   const pts = {};
   const existing = existingStagePoints || {};
   let remaining = totalPoints;
 
+  const priorityInThisStage = skillNames.filter((name) => {
+  const root = skillRoot(name);
+  return prioritySkills.includes(name) || prioritySkills.includes(root);
+});
+
   while (remaining > 0) {
     let placed = false;
+
     for (let tries = 0; tries < 20 && remaining > 0; tries++) {
-      const s = skillNames[Math.floor(Math.random() * skillNames.length)];
+      // If we have priority skills in this stage, favour them ~70% of the time
+      let pool = skillNames;
+      if (priorityInThisStage.length && Math.random() < 0.7) {
+        pool = priorityInThisStage;
+      }
+
+      const s = pool[Math.floor(Math.random() * pool.length)];
       const current = (existing[s] || 0) + (pts[s] || 0);
-      if (current < maxPerSkill) {
+
+      if (maxPerSkill == null || current < maxPerSkill) {
         pts[s] = (pts[s] || 0) + 1;
         remaining -= 1;
         placed = true;
-        break;
       }
     }
+
     if (!placed) break; // everything likely capped
   }
   return pts;
@@ -140,8 +266,14 @@ function generateCharacteristics() {
   };
 }
 
+// Core Mythras AP calculation: based on INT + DEX
 function calcActionPoints(intVal, dexVal) {
-  return 2; // Imperative: flat 2 AP
+  const total = intVal + dexVal;
+  if (total <= 12) return 1;
+  if (total <= 24) return 2;
+  if (total <= 36) return 3;
+  // Every additional 12 points gives +1 AP
+  return 3 + Math.ceil((total - 36) / 12);
 }
 
 function calcDamageMod(strVal, sizVal) {
@@ -244,21 +376,36 @@ function generateRandomMythrasCharacter() {
   }
 
   // Combat styles: one at culture, one at career
-  const cultureStyleLabel = culture.combat_styles[Math.floor(Math.random() * culture.combat_styles.length)];
+  const cultureStyleLabel =
+    culture.combat_styles[Math.floor(Math.random() * culture.combat_styles.length)];
   const cultureStyleSkill = `Combat Style (${cultureStyleLabel})`;
   ensureSkill(skills, cultureStyleSkill, chars);
 
   const careerStyleOptions = [cultureStyleLabel, `${career.name} Style`];
-  const careerStyleLabel = careerStyleOptions[Math.floor(Math.random() * careerStyleOptions.length)];
+  const careerStyleLabel =
+    careerStyleOptions[Math.floor(Math.random() * careerStyleOptions.length)];
   const careerStyleSkill = `Combat Style (${careerStyleLabel})`;
   ensureSkill(skills, careerStyleSkill, chars);
 
-  // --- Culture stage: min +5 on cultural standard skills, 3 cultural prof skills, and cultural combat style ---
-  const cultureStdSpecialised = culture.standard_skills.map(specialise);
-  const cultureProfAll = culture.professional_skills.map(specialise);
+  /* --- Culture stage: min +5 on cultural standard skills,
+         3 cultural prof skills, and cultural combat style --- */
+  // Expand any choice arrays first (e.g. ["Boating", "Ride"])
+  const expandedCultureStd = expandSkillChoices(culture.standard_skills);
+  const expandedCultureProf = expandSkillChoices(culture.professional_skills);
 
-  const shuffledCultureProf = [...cultureProfAll].sort(() => Math.random() - 0.5);
-  const pickedCultureProf = shuffledCultureProf.slice(0, Math.min(3, shuffledCultureProf.length));
+  const cultureStdSpecialised = expandedCultureStd.map(specialise);
+  const cultureProfAll = expandedCultureProf.map(specialise);
+
+const shuffledCultureProf = [...cultureProfAll].sort(() => Math.random() - 0.5);
+const maxCultureProf = Math.min(3, shuffledCultureProf.length);
+
+let pickedCultureProf = shuffledCultureProf.slice(0, maxCultureProf);
+pickedCultureProf = ensurePairedSpecialsInSelection(
+  pickedCultureProf,
+  cultureProfAll,
+  maxCultureProf
+);
+
 
   const mandatorySkillsSet = new Set([
     ...cultureStdSpecialised,
@@ -282,38 +429,57 @@ function generateRandomMythrasCharacter() {
     extraCultureSkillList,
     remainingCulture,
     15,
-    cultureStagePoints
+    cultureStagePoints,
+    typeof PRIORITY_SKILLS !== "undefined" ? PRIORITY_SKILLS : []
   );
   for (const [s, pts] of Object.entries(extraCulturePoints)) {
     cultureStagePoints[s] = (cultureStagePoints[s] || 0) + pts;
   }
 
-  applyStagePoints(skills, cultureStagePoints, "culture", chars);
+	// ... after merging extraCulturePoints ...
+	enforceSpecialPairsInStagePoints(cultureStagePoints);
+	applyStagePoints(skills, cultureStagePoints, "culture", chars);
 
-  // --- Career stage: 100 pts, choose 3 pro skills, no mandatory minimum ---
-  const careerStdSpecialised = career.standard_skills.map(specialise);
-  const careerProfAll = career.professional_skills.map(specialise);
-  const shuffledCareerProf = [...careerProfAll].sort(() => Math.random() - 0.5);
-  const pickedCareerProf = shuffledCareerProf.slice(0, Math.min(3, shuffledCareerProf.length));
-  const careerSkillSet = new Set([...careerStdSpecialised, ...pickedCareerProf, careerStyleSkill]);
+  /* --- Career stage: 100 pts, choose 3 pro skills, no mandatory minimum --- */
+const careerStdSpecialised = career.standard_skills.map(specialise);
+const careerProfAll = career.professional_skills.map(specialise);
+const shuffledCareerProf = [...careerProfAll].sort(() => Math.random() - 0.5);
+const maxCareerProf = Math.min(3, shuffledCareerProf.length);
+
+let pickedCareerProf2 = shuffledCareerProf.slice(0, maxCareerProf);
+pickedCareerProf2 = ensurePairedSpecialsInSelection(
+  pickedCareerProf2,
+  careerProfAll,
+  maxCareerProf
+);
+
+  const careerSkillSet = new Set([
+    ...careerStdSpecialised,
+    ...pickedCareerProf2,
+    careerStyleSkill,
+  ]);
   const careerSkillList = Array.from(careerSkillSet);
 
   const careerPoints = randomPointDistributionCappedStage(
     careerSkillList,
     100,
     15,
-    null
+    null,
+    typeof PRIORITY_SKILLS !== "undefined" ? PRIORITY_SKILLS : []
   );
+  enforceSpecialPairsInStagePoints(careerPoints);
   applyStagePoints(skills, careerPoints, "career", chars);
 
-  // --- Bonus stage: 150 pts on any skill we have so far ---
+  /* --- Bonus stage: 150 pts on any skill we have so far --- */
   const bonusSkillList = Object.keys(skills);
   const bonusPoints = randomPointDistributionCappedStage(
     bonusSkillList,
     150,
     15,
-    null
+    null,
+    typeof PRIORITY_SKILLS !== "undefined" ? PRIORITY_SKILLS : []
   );
+  enforceSpecialPairsInStagePoints(bonusPoints);
   applyStagePoints(skills, bonusPoints, "bonus", chars);
 
   finalizeSkillTotals(skills);
@@ -357,7 +523,10 @@ function generateRandomMythrasCharacter() {
 
 function renderSkillTable(title, skillNames, skills) {
   if (!skillNames.length) return `<h3>${title}</h3><p><em>None</em></p>`;
-  let html = `<h3>${title}</h3><table><thead><tr><th>Skill</th><th>Total</th><th>Breakdown</th></tr></thead><tbody>`;
+  let html =
+    `<h3>${title}</h3><table><thead>` +
+    `<tr><th>Skill</th><th>Total</th><th>Breakdown</th></tr>` +
+    `</thead><tbody>`;
   for (const name of skillNames) {
     const rec = skills[name];
     html += `<tr>
@@ -374,26 +543,31 @@ function renderCharacter(c) {
   const app = document.getElementById("app");
   if (!app) return;
 
-  const combatStyleNames = Object.keys(c.combat_styles)
-    .sort((a, b) => c.combat_styles[b].total - c.combat_styles[a].total);
+  const combatStyleNames = Object.keys(c.combat_styles).sort(
+    (a, b) => c.combat_styles[b].total - c.combat_styles[a].total
+  );
 
-const standardNames = Object.keys(c.skills).filter(
-  (s) => STANDARD_SKILLS.includes(skillRoot(s)) && !s.startsWith("Combat Style")
-).sort((a, b) => a.localeCompare(b));
+  const standardNames = Object.keys(c.skills)
+    .filter(
+      (s) => STANDARD_SKILLS.includes(skillRoot(s)) && !s.startsWith("Combat Style")
+    )
+    .sort((a, b) => a.localeCompare(b));
 
-const professionalNames = Object.keys(c.skills).filter(
-  (s) => !STANDARD_SKILLS.includes(skillRoot(s)) && !s.startsWith("Combat Style")
-).sort((a, b) => a.localeCompare(b));
+  const professionalNames = Object.keys(c.skills)
+    .filter(
+      (s) => !STANDARD_SKILLS.includes(skillRoot(s)) && !s.startsWith("Combat Style")
+    )
+    .sort((a, b) => a.localeCompare(b));
 
   let html = "";
 
   html += `<h1>${c.name}</h1>`;
-//  html += `<div class="meta-line"><strong>Gender:</strong> ${c.gender}</div>`;
+  // html += `<div class="meta-line"><strong>Gender:</strong> ${c.gender}</div>`;
   html += `<div class="meta-line"><strong>Age:</strong> ${c.age}</div>`;
   html += `<div class="meta-line"><strong>Culture:</strong> ${c.culture}</div>`;
   html += `<div class="meta-line"><strong>Career:</strong> ${c.career}</div>`;
 
-  // === NEW: three columns for Characteristics, Attributes, Hit Locations ===
+  // === three columns for Characteristics, Attributes, Hit Locations ===
   html += `<div class="section-columns">`;
 
   // Column 1: Characteristics
@@ -412,39 +586,41 @@ const professionalNames = Object.keys(c.skills).filter(
   }
   html += `</ul></div>`;
 
-// Column 3: Hit Locations
-html += `<div class="section-column">`;
-html += `<h2>Hit Locations</h2>`;
+  // Column 3: Hit Locations
+  html += `<div class="section-column">`;
+  html += `<h2>Hit Locations</h2>`;
 
-// map the locations to 1d20 ranges and display names
-const hitRows = [
-  { key: "R Leg", label: "Right Leg", range: "1–3" },
-  { key: "L Leg", label: "Left Leg",  range: "4–6" },
-  { key: "Abdomen", label: "Abdomen", range: "7–9" },
-  { key: "Chest",   label: "Chest",   range: "10–12" },
-  { key: "R Arm",   label: "Right Arm", range: "13–15" },
-  { key: "L Arm",   label: "Left Arm",  range: "16–18" },
-  { key: "Head",    label: "Head",      range: "19–20" },
-];
+  const hitRows = [
+    { key: "R Leg", label: "Right Leg", range: "1–3" },
+    { key: "L Leg", label: "Left Leg", range: "4–6" },
+    { key: "Abdomen", label: "Abdomen", range: "7–9" },
+    { key: "Chest", label: "Chest", range: "10–12" },
+    { key: "R Arm", label: "Right Arm", range: "13–15" },
+    { key: "L Arm", label: "Left Arm", range: "16–18" },
+    { key: "Head", label: "Head", range: "19–20" },
+  ];
 
-html += `<table><thead><tr><th>1d20</th><th>Location</th><th>HP</th></tr></thead><tbody>`;
-for (const row of hitRows) {
-  const hp = c.hit_points[row.key] ?? "-";
-  html += `<tr>
-    <td>${row.range}</td>
-    <td>${row.label}</td>
-    <td>${hp}</td>
-  </tr>`;
-}
-html += `</tbody></table>`;
-html += `</div>`;
+  html += `<table><thead><tr><th>1d20</th><th>Location</th><th>HP</th></tr></thead><tbody>`;
+  for (const row of hitRows) {
+    const hp = c.hit_points[row.key] ?? "-";
+    html += `<tr>
+      <td>${row.range}</td>
+      <td>${row.label}</td>
+      <td>${hp}</td>
+    </tr>`;
+  }
+  html += `</tbody></table>`;
+  html += `</div>`;
 
   html += `</div>`; // end .section-columns
 
   // === Combat Styles ===
   html += `<h2>Combat Styles</h2>`;
   if (combatStyleNames.length) {
-    html += `<table><thead><tr><th>Style</th><th>Total</th><th>Breakdown</th></tr></thead><tbody>`;
+    html +=
+      `<table><thead>` +
+      `<tr><th>Style</th><th>Total</th><th>Breakdown</th></tr>` +
+      `</thead><tbody>`;
     for (const label of combatStyleNames) {
       const rec = c.combat_styles[label];
       html += `<tr>
@@ -459,9 +635,8 @@ html += `</div>`;
   }
 
   // === Skills ===
-html += renderSkillTable("Standard Skills", standardNames, c.skills);
-html += renderSkillTable("Professional Skills", professionalNames, c.skills);
-
+  html += renderSkillTable("Standard Skills", standardNames, c.skills);
+  html += renderSkillTable("Professional Skills", professionalNames, c.skills);
 
   // === Passions ===
   html += `<h2>Passions</h2>`;
